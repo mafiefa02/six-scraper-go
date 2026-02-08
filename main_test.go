@@ -312,15 +312,19 @@ func clearCache() {
 func TestCache_SetAndGet(t *testing.T) {
 	clearCache()
 	data := []CourseClass{{Code: "FI1210", Name: "Test"}}
+	now := time.Now()
 
-	setCache("key1", data)
+	setCache("key1", data, now)
 
-	got, ok := getCached("key1")
+	entry, ok := getCached("key1")
 	if !ok {
 		t.Fatal("expected cache hit")
 	}
-	if len(got) != 1 || got[0].Code != "FI1210" {
-		t.Errorf("cached data mismatch: %+v", got)
+	if len(entry.data) != 1 || entry.data[0].Code != "FI1210" {
+		t.Errorf("cached data mismatch: %+v", entry.data)
+	}
+	if !entry.fetchedAt.Equal(now) {
+		t.Errorf("fetchedAt = %v, want %v", entry.fetchedAt, now)
 	}
 }
 
@@ -394,6 +398,16 @@ func TestScheduleHandler_MissingParams(t *testing.T) {
 			if w.Code != http.StatusBadRequest {
 				t.Errorf("got status %d, want %d", w.Code, http.StatusBadRequest)
 			}
+			var resp APIResponse
+			if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+				t.Fatal(err)
+			}
+			if resp.Success {
+				t.Error("expected success to be false")
+			}
+			if resp.Error == "" {
+				t.Error("expected non-empty error message")
+			}
 		})
 	}
 }
@@ -406,6 +420,16 @@ func TestScheduleHandler_MissingCookies(t *testing.T) {
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("got status %d, want %d", w.Code, http.StatusBadGateway)
 	}
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Success {
+		t.Error("expected success to be false")
+	}
+	if resp.Error == "" {
+		t.Error("expected non-empty error message")
+	}
 }
 
 func TestScheduleHandler_CacheHit(t *testing.T) {
@@ -413,7 +437,7 @@ func TestScheduleHandler_CacheHit(t *testing.T) {
 
 	cached := []CourseClass{{Code: "CACHED01", Name: "From Cache"}}
 	key := buildScheduleURL("123", "1945-1", url.Values{})
-	setCache(key, cached)
+	setCache(key, cached, time.Now())
 
 	req := httptest.NewRequest("GET", "/api/schedule?student_id=123&semester=1945-1", nil)
 	addAuthCookies(req)
@@ -424,8 +448,27 @@ func TestScheduleHandler_CacheHit(t *testing.T) {
 		t.Fatalf("got status %d, want 200", w.Code)
 	}
 
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Success {
+		t.Error("expected success to be true")
+	}
+	if resp.Meta == nil {
+		t.Fatal("expected meta to be present")
+	}
+	if !resp.Meta.Cached {
+		t.Error("expected meta.cached to be true")
+	}
+
+	// Decode data as []CourseClass
+	dataBytes, err := json.Marshal(resp.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var classes []CourseClass
-	if err := json.NewDecoder(w.Body).Decode(&classes); err != nil {
+	if err := json.Unmarshal(dataBytes, &classes); err != nil {
 		t.Fatal(err)
 	}
 	if len(classes) != 1 || classes[0].Code != "CACHED01" {
@@ -438,7 +481,7 @@ func TestScheduleHandler_RefreshBypassesCache(t *testing.T) {
 
 	cached := []CourseClass{{Code: "STALE", Name: "Stale Data"}}
 	key := buildScheduleURL("123", "1945-1", url.Values{})
-	setCache(key, cached)
+	setCache(key, cached, time.Now())
 
 	// With refresh=true, the handler should not return the cached data.
 	// It will try to fetch from upstream (which won't work without a real server),
@@ -450,8 +493,11 @@ func TestScheduleHandler_RefreshBypassesCache(t *testing.T) {
 
 	// Should not have returned 200 with stale data
 	if w.Code == http.StatusOK {
+		var resp APIResponse
+		json.NewDecoder(w.Body).Decode(&resp)
+		dataBytes, _ := json.Marshal(resp.Data)
 		var classes []CourseClass
-		json.NewDecoder(w.Body).Decode(&classes)
+		json.Unmarshal(dataBytes, &classes)
 		if len(classes) == 1 && classes[0].Code == "STALE" {
 			t.Error("refresh=true should bypass cache, but got stale cached data")
 		}
@@ -464,5 +510,15 @@ func TestUserHandler_MissingCookies(t *testing.T) {
 	userHandler(w, req)
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("got status %d, want %d", w.Code, http.StatusBadGateway)
+	}
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Success {
+		t.Error("expected success to be false")
+	}
+	if resp.Error == "" {
+		t.Error("expected non-empty error message")
 	}
 }

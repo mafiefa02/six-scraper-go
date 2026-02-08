@@ -47,12 +47,25 @@ type UserResponse struct {
 	Semester  string `json:"semester"`
 }
 
+type APIResponse struct {
+	Success bool   `json:"success"`
+	Data    any    `json:"data,omitempty"`
+	Meta    *Meta  `json:"meta,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type Meta struct {
+	FetchedAt time.Time `json:"fetched_at"`
+	Cached    bool      `json:"cached"`
+}
+
 var requiredCookies = []string{"nissin", "khongguan"}
 
 const cacheTTL = 5 * time.Minute
 
 type cacheEntry struct {
 	data      []CourseClass
+	fetchedAt time.Time
 	expiresAt time.Time
 }
 
@@ -144,9 +157,24 @@ func fetchDoc(client *http.Client, targetURL string, r *http.Request) (*goquery.
 	return doc, resp, nil
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
+func writeSuccess(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(v); err != nil {
+	if err := json.NewEncoder(w).Encode(APIResponse{Success: true, Data: data}); err != nil {
+		log.Printf("json encode error: %v", err)
+	}
+}
+
+func writeSuccessWithMeta(w http.ResponseWriter, data any, meta *Meta) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(APIResponse{Success: true, Data: data, Meta: meta}); err != nil {
+		log.Printf("json encode error: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(APIResponse{Success: false, Error: msg}); err != nil {
 		log.Printf("json encode error: %v", err)
 	}
 }
@@ -161,7 +189,7 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 	// Get Student ID from /home
 	doc, _, err := fetchDoc(client, sixBaseURL+"/home", r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
@@ -176,7 +204,7 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if studentID == "" {
-		http.Error(w, "Could not find student ID on /home", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "Could not find student ID on /home")
 		return
 	}
 
@@ -184,13 +212,13 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 	redirectURL := fmt.Sprintf("%s/app/mahasiswa:%s/kelas", sixBaseURL, studentID)
 	req, err := newSIXRequest(redirectURL, r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	resp.Body.Close()
@@ -198,11 +226,11 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 	finalURL := resp.Request.URL.String()
 	m := semesterRe.FindStringSubmatch(finalURL)
 	if len(m) < 2 {
-		http.Error(w, "Could not infer semester from redirect URL: "+finalURL, http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "Could not infer semester from redirect URL: "+finalURL)
 		return
 	}
 
-	writeJSON(w, UserResponse{StudentID: studentID, Semester: m[1]})
+	writeSuccess(w, UserResponse{StudentID: studentID, Semester: m[1]})
 }
 
 func scheduleHandler(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +239,7 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 	semester := query.Get("semester")
 
 	if studentID == "" || semester == "" {
-		http.Error(w, "Missing student_id or semester query parameters", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "Missing student_id or semester query parameters")
 		return
 	}
 
@@ -219,9 +247,9 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 	refresh := query.Get("refresh") == "true"
 
 	if !refresh {
-		if classes, ok := getCached(targetURL); ok {
+		if entry, ok := getCached(targetURL); ok {
 			log.Printf("cache hit student_id=%s semester=%s", studentID, semester)
-			writeJSON(w, classes)
+			writeSuccessWithMeta(w, entry.data, &Meta{FetchedAt: entry.fetchedAt, Cached: true})
 			return
 		}
 	}
@@ -230,30 +258,31 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 	client := newHTTPClient()
 	doc, _, err := fetchDoc(client, targetURL, r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
+	now := time.Now()
 	classes := parseClasses(doc)
 	log.Printf("parsed classes=%d student_id=%s semester=%s", len(classes), studentID, semester)
-	setCache(targetURL, classes)
-	writeJSON(w, classes)
+	setCache(targetURL, classes, now)
+	writeSuccessWithMeta(w, classes, &Meta{FetchedAt: now, Cached: false})
 }
 
-func getCached(key string) ([]CourseClass, bool) {
+func getCached(key string) (cacheEntry, bool) {
 	cacheMu.RLock()
 	defer cacheMu.RUnlock()
 	entry, ok := scheduleCache[key]
 	if !ok || time.Now().After(entry.expiresAt) {
-		return nil, false
+		return cacheEntry{}, false
 	}
-	return entry.data, true
+	return entry, true
 }
 
-func setCache(key string, data []CourseClass) {
+func setCache(key string, data []CourseClass, fetchedAt time.Time) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	scheduleCache[key] = cacheEntry{data: data, expiresAt: time.Now().Add(cacheTTL)}
+	scheduleCache[key] = cacheEntry{data: data, fetchedAt: fetchedAt, expiresAt: time.Now().Add(cacheTTL)}
 }
 
 func buildScheduleURL(studentID, semester string, query url.Values) string {
