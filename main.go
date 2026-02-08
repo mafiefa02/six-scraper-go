@@ -62,11 +62,35 @@ var (
 )
 
 func main() {
-	http.HandleFunc("/api/user", userHandler)
-	http.HandleFunc("/api/schedule", scheduleHandler)
+	http.Handle("/api/user", logRequest(http.HandlerFunc(userHandler)))
+	http.Handle("/api/schedule", logRequest(http.HandlerFunc(scheduleHandler)))
 
 	fmt.Println("Server starting on :8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// Wraps a handler and logs method, path, status, and total duration.
+func logRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		log.Printf("%s %s status=%d duration=%s", r.Method, r.URL.String(), sw.status, time.Since(start))
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	if !sw.wroteHeader {
+		sw.status = code
+		sw.wroteHeader = true
+	}
+	sw.ResponseWriter.WriteHeader(code)
 }
 
 // Creates an outbound request to SIX, forwarding auth cookies from the incoming request.
@@ -95,21 +119,28 @@ func fetchDoc(client *http.Client, targetURL string, r *http.Request) (*goquery.
 		return nil, nil, err
 	}
 
+	fetchStart := time.Now()
 	resp, err := client.Do(req)
+	fetchDuration := time.Since(fetchStart)
 	if err != nil {
+		log.Printf("fetch error url=%s duration=%s err=%v", targetURL, fetchDuration, err)
 		return nil, nil, err
 	}
+
+	log.Printf("fetch url=%s status=%d duration=%s", targetURL, resp.StatusCode, fetchDuration)
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		return nil, resp, fmt.Errorf("upstream returned %s", resp.Status)
 	}
 
+	parseStart := time.Now()
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	resp.Body.Close()
 	if err != nil {
 		return nil, resp, err
 	}
+	log.Printf("parse url=%s duration=%s", targetURL, time.Since(parseStart))
 	return doc, resp, nil
 }
 
@@ -189,10 +220,12 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !refresh {
 		if classes, ok := getCached(targetURL); ok {
+			log.Printf("cache hit student_id=%s semester=%s", studentID, semester)
 			writeJSON(w, classes)
 			return
 		}
 	}
+	log.Printf("cache miss student_id=%s semester=%s refresh=%v", studentID, semester, refresh)
 
 	client := newHTTPClient()
 	doc, _, err := fetchDoc(client, targetURL, r)
@@ -202,6 +235,7 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	classes := parseClasses(doc)
+	log.Printf("parsed classes=%d student_id=%s semester=%s", len(classes), studentID, semester)
 	setCache(targetURL, classes)
 	writeJSON(w, classes)
 }
