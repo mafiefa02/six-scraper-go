@@ -66,9 +66,9 @@ GET /api/schedule?student_id=10223085&semester=2025-2
   {
     "code": "FI1210",
     "name": "Fisika Dasar",
-    "sks": "3",
+    "sks": 3,
     "class_no": "01",
-    "quota": "40/45",
+    "quota": 45,
     "lecturers": ["Dosen A", "Dosen B"],
     "notes": "",
     "schedules": [

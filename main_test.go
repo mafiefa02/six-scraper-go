@@ -141,7 +141,7 @@ const testScheduleHTML = `<html><body>
 	<td>Fisika Dasar</td>
 	<td>3</td>
 	<td>01</td>
-	<td>40/45</td>
+	<td>45</td>
 	<td><ul><li>Dosen A</li><li>Dosen B</li></ul></td>
 	<td>
 		Catatan
@@ -161,7 +161,7 @@ const testScheduleHTML = `<html><body>
 	<td>Fisika Lanjut</td>
 	<td>3</td>
 	<td>02</td>
-	<td>35/40</td>
+	<td>40</td>
 	<td><ul><li>Dosen C</li></ul></td>
 	<td></td>
 	<td>
@@ -196,14 +196,14 @@ func TestParseClasses(t *testing.T) {
 	if c.Name != "Fisika Dasar" {
 		t.Errorf("Name = %q, want Fisika Dasar", c.Name)
 	}
-	if c.SKS != "3" {
-		t.Errorf("SKS = %q, want 3", c.SKS)
+	if c.SKS != 3 {
+		t.Errorf("SKS = %d, want 3", c.SKS)
 	}
 	if c.ClassNo != "01" {
 		t.Errorf("ClassNo = %q, want 01", c.ClassNo)
 	}
-	if c.Quota != "40/45" {
-		t.Errorf("Quota = %q, want 40/45", c.Quota)
+	if c.Quota != 45 {
+		t.Errorf("Quota = %d, want 45", c.Quota)
 	}
 	if len(c.Lecturers) != 2 || c.Lecturers[0] != "Dosen A" || c.Lecturers[1] != "Dosen B" {
 		t.Errorf("Lecturers = %v, want [Dosen A, Dosen B]", c.Lecturers)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,9 +34,9 @@ type ScheduleEntry struct {
 type CourseClass struct {
 	Code      string          `json:"code"`
 	Name      string          `json:"name"`
-	SKS       string          `json:"sks"`
+	SKS       int             `json:"sks"`
 	ClassNo   string          `json:"class_no"`
-	Quota     string          `json:"quota"`
+	Quota     int             `json:"quota"`
 	Lecturers []string        `json:"lecturers"`
 	Notes     string          `json:"notes"`
 	Schedules []ScheduleEntry `json:"schedules"`
@@ -245,12 +246,15 @@ func parseClasses(doc *goquery.Document) []CourseClass {
 			return
 		}
 
+		sks, _ := strconv.Atoi(strings.TrimSpace(cells.Eq(4).Text()))
+		quota, _ := strconv.Atoi(strings.TrimSpace(cells.Eq(6).Text()))
+
 		class := CourseClass{
 			Code:      strings.TrimSpace(cells.Eq(2).Text()),
 			Name:      strings.TrimSpace(cells.Eq(3).Text()),
-			SKS:       strings.TrimSpace(cells.Eq(4).Text()),
+			SKS:       sks,
 			ClassNo:   strings.TrimSpace(cells.Eq(5).Text()),
-			Quota:     strings.TrimSpace(cells.Eq(6).Text()),
+			Quota:     quota,
 			Lecturers: parseLecturers(cells.Eq(7)),
 			Notes:     collapseWhitespace(cells.Eq(8).Text()),
 			Schedules: parseSchedules(cells.Eq(9)),
