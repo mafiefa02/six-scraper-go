@@ -106,21 +106,19 @@ func (sw *statusWriter) WriteHeader(code int) {
 	sw.ResponseWriter.WriteHeader(code)
 }
 
-// Creates an outbound request to SIX, forwarding auth cookies from the incoming request.
+// Creates an outbound request to SIX
 func newSIXRequest(targetURL string, r *http.Request) (*http.Request, error) {
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, name := range requiredCookies {
-		c, err := r.Cookie(name)
-		if err != nil {
-			return nil, fmt.Errorf("missing required cookie: %s", name)
-		}
-		req.AddCookie(c)
+	v := r.Header.Get("X-Six-Khongguan")
+	if v == "" {
+		return nil, fmt.Errorf("missing required khongguan token")
 	}
 
+	req.AddCookie(&http.Cookie{Name: "khongguan", Value: v})
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	return req, nil
 }
