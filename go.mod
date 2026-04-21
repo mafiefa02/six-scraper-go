@@ -1,4 +1,4 @@
-module six-scraper-go
+module github.com/mafiefa02/six-scraper-go
 
 go 1.25.5
 
