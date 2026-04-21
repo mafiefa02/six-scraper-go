@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -68,28 +69,20 @@ func TestBuildScheduleURL(t *testing.T) {
 }
 
 func TestNewSIXRequest(t *testing.T) {
-	t.Run("forwards cookies", func(t *testing.T) {
+	t.Run("forwards token as cookie", func(t *testing.T) {
 		incoming := httptest.NewRequest("GET", "/test", nil)
-		incoming.AddCookie(&http.Cookie{Name: "nissin", Value: "abc"})
-		incoming.AddCookie(&http.Cookie{Name: "khongguan", Value: "xyz"})
+		incoming.Header.Set("X-Six-Khongguan", "xyz")
 
-		req, err := newSIXRequest("https://example.com", incoming)
+		req, err := newSIXRequest(context.Background(), "https://example.com", incoming)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		for _, name := range []string{"nissin", "khongguan"} {
-			c, err := req.Cookie(name)
-			if err != nil {
-				t.Errorf("missing cookie %q", name)
-				continue
-			}
-			if name == "nissin" && c.Value != "abc" {
-				t.Errorf("nissin = %q, want %q", c.Value, "abc")
-			}
-			if name == "khongguan" && c.Value != "xyz" {
-				t.Errorf("khongguan = %q, want %q", c.Value, "xyz")
-			}
+		c, err := req.Cookie("khongguan")
+		if err != nil {
+			t.Errorf("missing cookie %q", "khongguan")
+		} else if c.Value != "xyz" {
+			t.Errorf("khongguan cookie = %q, want %q", c.Value, "xyz")
 		}
 
 		if ua := req.Header.Get("User-Agent"); ua == "" {
@@ -97,37 +90,15 @@ func TestNewSIXRequest(t *testing.T) {
 		}
 	})
 
-	t.Run("rejects missing nissin", func(t *testing.T) {
+	t.Run("rejects missing token", func(t *testing.T) {
 		incoming := httptest.NewRequest("GET", "/test", nil)
-		incoming.AddCookie(&http.Cookie{Name: "khongguan", Value: "xyz"})
 
-		_, err := newSIXRequest("https://example.com", incoming)
+		_, err := newSIXRequest(context.Background(), "https://example.com", incoming)
 		if err == nil {
-			t.Fatal("expected error for missing nissin cookie")
-		}
-		if !strings.Contains(err.Error(), "nissin") {
-			t.Errorf("error should mention nissin: %v", err)
-		}
-	})
-
-	t.Run("rejects missing khongguan", func(t *testing.T) {
-		incoming := httptest.NewRequest("GET", "/test", nil)
-		incoming.AddCookie(&http.Cookie{Name: "nissin", Value: "abc"})
-
-		_, err := newSIXRequest("https://example.com", incoming)
-		if err == nil {
-			t.Fatal("expected error for missing khongguan cookie")
+			t.Fatal("expected error for missing khongguan token")
 		}
 		if !strings.Contains(err.Error(), "khongguan") {
 			t.Errorf("error should mention khongguan: %v", err)
-		}
-	})
-
-	t.Run("rejects no cookies", func(t *testing.T) {
-		incoming := httptest.NewRequest("GET", "/test", nil)
-		_, err := newSIXRequest("https://example.com", incoming)
-		if err == nil {
-			t.Fatal("expected error for missing cookies")
 		}
 	})
 }
@@ -339,7 +310,6 @@ func TestCache_Miss(t *testing.T) {
 func TestCache_Expiry(t *testing.T) {
 	clearCache()
 
-	// Manually insert an expired entry
 	cacheMu.Lock()
 	scheduleCache["expired"] = cacheEntry{
 		data:      []CourseClass{{Code: "OLD"}},
@@ -353,7 +323,7 @@ func TestCache_Expiry(t *testing.T) {
 	}
 }
 
-// Creates a test server that mimics the SIX endpoints needed by the handlers.
+// mockSIX creates a test server that mimics the SIX endpoints needed by the handlers.
 func mockSIX(studentID, semester string) *httptest.Server {
 	mux := http.NewServeMux()
 
@@ -369,16 +339,14 @@ func mockSIX(studentID, semester string) *httptest.Server {
 			http.Redirect(w, r, dest, http.StatusFound)
 			return
 		}
-		// Serve schedule page
 		fmt.Fprint(w, testScheduleHTML)
 	})
 
 	return httptest.NewServer(mux)
 }
 
-func addAuthCookies(r *http.Request) {
-	r.AddCookie(&http.Cookie{Name: "nissin", Value: "test"})
-	r.AddCookie(&http.Cookie{Name: "khongguan", Value: "test"})
+func addAuthHeaders(r *http.Request) {
+	r.Header.Set("X-Six-Khongguan", "test")
 }
 
 func TestScheduleHandler_MissingParams(t *testing.T) {
@@ -392,7 +360,7 @@ func TestScheduleHandler_MissingParams(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "/api/schedule"+tt.query, nil)
-			addAuthCookies(req)
+			addAuthHeaders(req)
 			w := httptest.NewRecorder()
 			scheduleHandler(w, req)
 			if w.Code != http.StatusBadRequest {
@@ -412,7 +380,34 @@ func TestScheduleHandler_MissingParams(t *testing.T) {
 	}
 }
 
-func TestScheduleHandler_MissingCookies(t *testing.T) {
+func TestScheduleHandler_InvalidParams(t *testing.T) {
+	tests := []struct {
+		name, query string
+	}{
+		{"non-numeric student_id", "?student_id=abc&semester=2024-1"},
+		{"invalid semester format", "?student_id=123&semester=not-valid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/schedule"+tt.query, nil)
+			addAuthHeaders(req)
+			w := httptest.NewRecorder()
+			scheduleHandler(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("got status %d, want 400", w.Code)
+			}
+			var resp APIResponse
+			if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+				t.Fatal(err)
+			}
+			if resp.Success {
+				t.Error("expected success to be false")
+			}
+		})
+	}
+}
+
+func TestScheduleHandler_MissingToken(t *testing.T) {
 	clearCache()
 	req := httptest.NewRequest("GET", "/api/schedule?student_id=123&semester=1945-1", nil)
 	w := httptest.NewRecorder()
@@ -440,7 +435,7 @@ func TestScheduleHandler_CacheHit(t *testing.T) {
 	setCache(key, cached, time.Now())
 
 	req := httptest.NewRequest("GET", "/api/schedule?student_id=123&semester=1945-1", nil)
-	addAuthCookies(req)
+	addAuthHeaders(req)
 	w := httptest.NewRecorder()
 	scheduleHandler(w, req)
 
@@ -462,7 +457,6 @@ func TestScheduleHandler_CacheHit(t *testing.T) {
 		t.Error("expected meta.cached to be true")
 	}
 
-	// Decode data as []CourseClass
 	dataBytes, err := json.Marshal(resp.Data)
 	if err != nil {
 		t.Fatal(err)
@@ -479,32 +473,107 @@ func TestScheduleHandler_CacheHit(t *testing.T) {
 func TestScheduleHandler_RefreshBypassesCache(t *testing.T) {
 	clearCache()
 
+	ts := mockSIX("123", "1945-1")
+	defer ts.Close()
+
+	origURL := sixBaseURL
+	sixBaseURL = ts.URL
+	defer func() { sixBaseURL = origURL }()
+
 	cached := []CourseClass{{Code: "STALE", Name: "Stale Data"}}
 	key := buildScheduleURL("123", "1945-1", url.Values{})
 	setCache(key, cached, time.Now())
 
-	// With refresh=true, the handler should not return the cached data.
-	// It will try to fetch from upstream (which won't work without a real server),
-	// so we expect a bad gateway rather than the cached response.
 	req := httptest.NewRequest("GET", "/api/schedule?student_id=123&semester=1945-1&refresh=true", nil)
-	addAuthCookies(req)
+	addAuthHeaders(req)
 	w := httptest.NewRecorder()
 	scheduleHandler(w, req)
 
-	// Should not have returned 200 with stale data
-	if w.Code == http.StatusOK {
-		var resp APIResponse
-		json.NewDecoder(w.Body).Decode(&resp)
-		dataBytes, _ := json.Marshal(resp.Data)
-		var classes []CourseClass
-		json.Unmarshal(dataBytes, &classes)
-		if len(classes) == 1 && classes[0].Code == "STALE" {
-			t.Error("refresh=true should bypass cache, but got stale cached data")
-		}
+	if w.Code != http.StatusOK {
+		t.Fatalf("got status %d, want 200", w.Code)
+	}
+
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Success {
+		t.Errorf("expected success, got error: %s", resp.Error)
+	}
+	if resp.Meta == nil || resp.Meta.Cached {
+		t.Error("expected non-cached fresh response")
+	}
+
+	dataBytes, _ := json.Marshal(resp.Data)
+	var classes []CourseClass
+	json.Unmarshal(dataBytes, &classes)
+	if len(classes) == 0 || classes[0].Code == "STALE" {
+		t.Errorf("expected fresh data from upstream, got %+v", classes)
 	}
 }
 
-func TestUserHandler_MissingCookies(t *testing.T) {
+const unauthenticatedHTML = `<html><body><nav><ul><li><a id="login" class="loginlink" href="/login">Login</a></li></ul></nav></body></html>`
+
+func TestScheduleHandler_ExpiredToken(t *testing.T) {
+	clearCache()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, unauthenticatedHTML)
+	}))
+	defer ts.Close()
+
+	origURL := sixBaseURL
+	sixBaseURL = ts.URL
+	defer func() { sixBaseURL = origURL }()
+
+	req := httptest.NewRequest("GET", "/api/schedule?student_id=123&semester=1945-1", nil)
+	addAuthHeaders(req)
+	w := httptest.NewRecorder()
+	scheduleHandler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("got status %d, want 401", w.Code)
+	}
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Success {
+		t.Error("expected success to be false")
+	}
+	if resp.Error == "" {
+		t.Error("expected non-empty error message")
+	}
+}
+
+func TestUserHandler_ExpiredToken(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, unauthenticatedHTML)
+	}))
+	defer ts.Close()
+
+	origURL := sixBaseURL
+	sixBaseURL = ts.URL
+	defer func() { sixBaseURL = origURL }()
+
+	req := httptest.NewRequest("GET", "/api/user", nil)
+	addAuthHeaders(req)
+	w := httptest.NewRecorder()
+	userHandler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("got status %d, want 401", w.Code)
+	}
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Success {
+		t.Error("expected success to be false")
+	}
+}
+
+func TestUserHandler_MissingToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/user", nil)
 	w := httptest.NewRecorder()
 	userHandler(w, req)

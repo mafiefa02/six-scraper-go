@@ -1,26 +1,39 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/sync/singleflight"
 )
 
-const sixBaseURL = "https://six.itb.ac.id"
+var (
+	sixBaseURL = envOrDefault("SIX_BASE_URL", "https://six.itb.ac.id")
+	listenAddr = envOrDefault("LISTEN_ADDR", ":8080")
+	cacheTTL   = mustParseDuration(envOrDefault("CACHE_TTL", "5m"))
+)
 
 var (
-	studentIDRe  = regexp.MustCompile(`mahasiswa:(\d+)`)
-	semesterRe   = regexp.MustCompile(`\+(\d{4}-\d)`)
-	whitespaceRe = regexp.MustCompile(`\s+`)
+	studentIDRe      = regexp.MustCompile(`mahasiswa:(\d+)`)
+	semesterRe       = regexp.MustCompile(`\+(\d{4}-\d)`)
+	whitespaceRe     = regexp.MustCompile(`\s+`)
+	studentIDValidRe = regexp.MustCompile(`^\d+$`)
+	semesterValidRe  = regexp.MustCompile(`^\d{4}-\d$`)
 )
 
 type ScheduleEntry struct {
@@ -59,10 +72,6 @@ type Meta struct {
 	Cached    bool      `json:"cached"`
 }
 
-var requiredCookies = []string{"nissin", "khongguan"}
-
-const cacheTTL = 5 * time.Minute
-
 type cacheEntry struct {
 	data      []CourseClass
 	fetchedAt time.Time
@@ -72,14 +81,73 @@ type cacheEntry struct {
 var (
 	scheduleCache = make(map[string]cacheEntry)
 	cacheMu       sync.RWMutex
+	sfGroup       singleflight.Group
 )
 
-func main() {
-	http.Handle("/api/user", logRequest(http.HandlerFunc(userHandler)))
-	http.Handle("/api/schedule", logRequest(http.HandlerFunc(scheduleHandler)))
+var errUnauthenticated = errors.New("khongguan token is expired or invalid")
 
-	fmt.Println("Server starting on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+// errStatus maps known sentinel errors to their HTTP status code.
+func errStatus(err error) int {
+	if errors.Is(err, errUnauthenticated) {
+		return http.StatusUnauthorized
+	}
+	return http.StatusBadGateway
+}
+
+var httpClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	},
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func mustParseDuration(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		log.Fatalf("invalid CACHE_TTL %q: %v", s, err)
+	}
+	return d
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.Handle("/api/user", logRequest(http.HandlerFunc(userHandler)))
+	mux.Handle("/api/schedule", logRequest(http.HandlerFunc(scheduleHandler)))
+
+	srv := &http.Server{
+		Addr:    listenAddr,
+		Handler: mux,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	startCacheEviction(ctx)
+
+	go func() {
+		log.Printf("Server starting on %s...", listenAddr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("Shutting down...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown error: %v", err)
+	}
 }
 
 // Wraps a handler and logs method, path, status, and total duration.
@@ -106,16 +174,16 @@ func (sw *statusWriter) WriteHeader(code int) {
 	sw.ResponseWriter.WriteHeader(code)
 }
 
-// Creates an outbound request to SIX
-func newSIXRequest(targetURL string, r *http.Request) (*http.Request, error) {
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
+// Creates an outbound request to SIX, forwarding the caller's khongguan token as a cookie.
+func newSIXRequest(ctx context.Context, targetURL string, r *http.Request) (*http.Request, error) {
 	v := r.Header.Get("X-Six-Khongguan")
 	if v == "" {
 		return nil, fmt.Errorf("missing required khongguan token")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	if err != nil {
+		return nil, err
 	}
 
 	req.AddCookie(&http.Cookie{Name: "khongguan", Value: v})
@@ -123,15 +191,15 @@ func newSIXRequest(targetURL string, r *http.Request) (*http.Request, error) {
 	return req, nil
 }
 
-// Performs a GET against targetURL (forwarding cookies from r) and returns the parsed document.
-func fetchDoc(client *http.Client, targetURL string, r *http.Request) (*goquery.Document, *http.Response, error) {
-	req, err := newSIXRequest(targetURL, r)
+// Performs a GET against targetURL (forwarding auth from r) and returns the parsed document.
+func fetchDoc(targetURL string, r *http.Request) (*goquery.Document, *http.Response, error) {
+	req, err := newSIXRequest(r.Context(), targetURL, r)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	fetchStart := time.Now()
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	fetchDuration := time.Since(fetchStart)
 	if err != nil {
 		log.Printf("fetch error url=%s duration=%s err=%v", targetURL, fetchDuration, err)
@@ -152,6 +220,9 @@ func fetchDoc(client *http.Client, targetURL string, r *http.Request) (*goquery.
 		return nil, resp, err
 	}
 	log.Printf("parse url=%s duration=%s", targetURL, time.Since(parseStart))
+	if doc.Find("a.loginlink").Length() > 0 {
+		return nil, resp, errUnauthenticated
+	}
 	return doc, resp, nil
 }
 
@@ -177,17 +248,10 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	}
 }
 
-func newHTTPClient() *http.Client {
-	return &http.Client{}
-}
-
 func userHandler(w http.ResponseWriter, r *http.Request) {
-	client := newHTTPClient()
-
-	// Get Student ID from /home
-	doc, _, err := fetchDoc(client, sixBaseURL+"/home", r)
+	doc, _, err := fetchDoc(sixBaseURL+"/home", r)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, errStatus(err), err.Error())
 		return
 	}
 
@@ -206,20 +270,30 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get Semester from redirect URL
 	redirectURL := fmt.Sprintf("%s/app/mahasiswa:%s/kelas", sixBaseURL, studentID)
-	req, err := newSIXRequest(redirectURL, r)
+	req, err := newSIXRequest(r.Context(), redirectURL, r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, "unexpected upstream status: "+resp.Status)
+		return
+	}
+
+	// A redirect to /home means the token has expired.
+	if resp.Request.URL.Path == "/home" {
+		writeError(w, http.StatusUnauthorized, errUnauthenticated.Error())
+		return
+	}
 
 	finalURL := resp.Request.URL.String()
 	m := semesterRe.FindStringSubmatch(finalURL)
@@ -241,6 +315,15 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !studentIDValidRe.MatchString(studentID) {
+		writeError(w, http.StatusBadRequest, "invalid student_id format")
+		return
+	}
+	if !semesterValidRe.MatchString(semester) {
+		writeError(w, http.StatusBadRequest, "invalid semester format")
+		return
+	}
+
 	targetURL := buildScheduleURL(studentID, semester, query)
 	refresh := query.Get("refresh") == "true"
 
@@ -253,18 +336,42 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("cache miss student_id=%s semester=%s refresh=%v", studentID, semester, refresh)
 
-	client := newHTTPClient()
-	doc, _, err := fetchDoc(client, targetURL, r)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+	// Validate auth per-caller before joining the singleflight group, so a caller
+	// with no token cannot piggyback on another caller's in-flight fetch.
+	if r.Header.Get("X-Six-Khongguan") == "" {
+		writeError(w, http.StatusBadGateway, "missing required khongguan token")
 		return
 	}
 
-	now := time.Now()
-	classes := parseClasses(doc)
-	log.Printf("parsed classes=%d student_id=%s semester=%s", len(classes), studentID, semester)
-	setCache(targetURL, classes, now)
-	writeSuccessWithMeta(w, classes, &Meta{FetchedAt: now, Cached: false})
+	type sfResult struct {
+		classes   []CourseClass
+		fetchedAt time.Time
+	}
+
+	v, err, _ := sfGroup.Do(targetURL, func() (any, error) {
+		// Use a background-derived context so that a disconnect by the first caller
+		// does not abort the fetch for all other waiters on this key.
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		doc, _, err := fetchDoc(targetURL, r.WithContext(fetchCtx))
+		if err != nil {
+			return nil, err
+		}
+		now := time.Now()
+		classes := parseClasses(doc)
+		log.Printf("parsed classes=%d student_id=%s semester=%s", len(classes), studentID, semester)
+		setCache(targetURL, classes, now)
+		return sfResult{classes: classes, fetchedAt: now}, nil
+	})
+
+	if err != nil {
+		writeError(w, errStatus(err), err.Error())
+		return
+	}
+
+	result := v.(sfResult)
+	writeSuccessWithMeta(w, result.classes, &Meta{FetchedAt: result.fetchedAt, Cached: false})
 }
 
 func getCached(key string) (cacheEntry, bool) {
@@ -281,6 +388,32 @@ func setCache(key string, data []CourseClass, fetchedAt time.Time) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 	scheduleCache[key] = cacheEntry{data: data, fetchedAt: fetchedAt, expiresAt: time.Now().Add(cacheTTL)}
+}
+
+func evictExpired() {
+	now := time.Now()
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	for k, v := range scheduleCache {
+		if now.After(v.expiresAt) {
+			delete(scheduleCache, k)
+		}
+	}
+}
+
+func startCacheEviction(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(cacheTTL)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				evictExpired()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 func buildScheduleURL(studentID, semester string, query url.Values) string {
@@ -341,7 +474,7 @@ func parseLecturers(cell *goquery.Selection) []string {
 
 func parseSchedules(cell *goquery.Selection) []ScheduleEntry {
 	var schedules []ScheduleEntry
-	seen := make(map[string]bool)
+	seen := make(map[ScheduleEntry]bool)
 
 	cell.Find("li").Each(func(_ int, li *goquery.Selection) {
 		text := collapseWhitespace(li.Text())
@@ -362,10 +495,9 @@ func parseSchedules(cell *goquery.Selection) []ScheduleEntry {
 			Method:   strings.TrimSpace(parts[5]),
 		}
 
-		key := entry.Day + "|" + entry.Time + "|" + entry.Room + "|" + entry.Activity + "|" + entry.Method
-		if !seen[key] {
+		if !seen[entry] {
 			schedules = append(schedules, entry)
-			seen[key] = true
+			seen[entry] = true
 		}
 	})
 
