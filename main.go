@@ -37,11 +37,14 @@ var (
 )
 
 type ScheduleEntry struct {
-	Day      string `json:"day"`
-	Time     string `json:"time"`
-	Room     string `json:"room"`
-	Activity string `json:"activity"`
-	Method   string `json:"method"`
+	ISODay    int      `json:"iso_day"`
+	Timezone  string   `json:"timezone"`
+	Dates     []string `json:"dates"`
+	StartTime string   `json:"start_time"`
+	EndTime   string   `json:"end_time"`
+	Rooms     []string `json:"rooms"`
+	Activity  string   `json:"activity"`
+	Method    string   `json:"method"`
 }
 
 type CourseClass struct {
@@ -51,7 +54,7 @@ type CourseClass struct {
 	ClassNo   string          `json:"class_no"`
 	Quota     int             `json:"quota"`
 	Lecturers []string        `json:"lecturers"`
-	Notes     string          `json:"notes"`
+	Notes     *string         `json:"notes"`
 	Schedules []ScheduleEntry `json:"schedules"`
 }
 
@@ -443,6 +446,11 @@ func parseClasses(doc *goquery.Document) []CourseClass {
 		sks, _ := strconv.Atoi(strings.TrimSpace(cells.Eq(4).Text()))
 		quota, _ := strconv.Atoi(strings.TrimSpace(cells.Eq(6).Text()))
 
+		var notes *string
+		if n := collapseWhitespace(cells.Eq(8).Text()); n != "" {
+			notes = &n
+		}
+
 		class := CourseClass{
 			Code:      strings.TrimSpace(cells.Eq(2).Text()),
 			Name:      strings.TrimSpace(cells.Eq(3).Text()),
@@ -450,7 +458,7 @@ func parseClasses(doc *goquery.Document) []CourseClass {
 			ClassNo:   strings.TrimSpace(cells.Eq(5).Text()),
 			Quota:     quota,
 			Lecturers: parseLecturers(cells.Eq(7)),
-			Notes:     collapseWhitespace(cells.Eq(8).Text()),
+			Notes:     notes,
 			Schedules: parseSchedules(cells.Eq(9)),
 		}
 
@@ -472,9 +480,21 @@ func parseLecturers(cell *goquery.Selection) []string {
 	return lecturers
 }
 
+type scheduleKey struct {
+	ISODay                        int
+	StartTime, EndTime, Activity, Method string
+}
+
 func parseSchedules(cell *goquery.Selection) []ScheduleEntry {
-	var schedules []ScheduleEntry
-	seen := make(map[ScheduleEntry]bool)
+	type accumulator struct {
+		dates     []string
+		dateSeen  map[string]bool
+		rooms     []string
+		roomSeen  map[string]bool
+	}
+
+	var order []scheduleKey
+	acc := make(map[scheduleKey]*accumulator)
 
 	cell.Find("li").Each(func(_ int, li *goquery.Selection) {
 		text := collapseWhitespace(li.Text())
@@ -487,24 +507,95 @@ func parseSchedules(cell *goquery.Selection) []ScheduleEntry {
 			return
 		}
 
-		entry := ScheduleEntry{
-			Day:      strings.TrimSpace(parts[0]),
-			Time:     strings.TrimSpace(parts[2]),
-			Room:     strings.TrimSpace(parts[3]),
-			Activity: strings.TrimSpace(parts[4]),
-			Method:   strings.TrimSpace(parts[5]),
+		start, end := parseScheduleTime(strings.TrimSpace(parts[2]))
+		key := scheduleKey{
+			ISODay:    idDays[strings.TrimSpace(parts[0])],
+			StartTime: start,
+			EndTime:   end,
+			Activity:  strings.TrimSpace(parts[4]),
+			Method:    strings.TrimSpace(parts[5]),
 		}
+		date := parseIndonesianDate(strings.TrimSpace(parts[1]))
+		room := strings.TrimSpace(parts[3])
 
-		if !seen[entry] {
-			schedules = append(schedules, entry)
-			seen[entry] = true
+		a, ok := acc[key]
+		if !ok {
+			a = &accumulator{dateSeen: make(map[string]bool), rooms: []string{}, roomSeen: make(map[string]bool)}
+			acc[key] = a
+			order = append(order, key)
+		}
+		if !a.dateSeen[date] {
+			a.dates = append(a.dates, date)
+			a.dateSeen[date] = true
+		}
+		if room != "-" && !a.roomSeen[room] {
+			a.rooms = append(a.rooms, room)
+			a.roomSeen[room] = true
 		}
 	})
 
+	schedules := make([]ScheduleEntry, 0, len(order))
+	for _, key := range order {
+		a := acc[key]
+		schedules = append(schedules, ScheduleEntry{
+			ISODay:    key.ISODay,
+			Timezone:  "Asia/Jakarta",
+			Dates:     a.dates,
+			StartTime: key.StartTime,
+			EndTime:   key.EndTime,
+			Rooms:     a.rooms,
+			Activity:  key.Activity,
+			Method:    key.Method,
+		})
+	}
 	return schedules
 }
 
 // Trims and collapses all runs of whitespace into a single space.
 func collapseWhitespace(s string) string {
 	return strings.TrimSpace(whitespaceRe.ReplaceAllString(s, " "))
+}
+
+var idDays = map[string]int{
+	"Senin":  1,
+	"Selasa": 2,
+	"Rabu":   3,
+	"Kamis":  4,
+	"Jumat":  5,
+	"Sabtu":  6,
+	"Minggu": 7,
+}
+
+var idMonths = map[string]string{
+	"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
+	"Mei": "05", "Jun": "06", "Jul": "07", "Agu": "08",
+	"Sep": "09", "Okt": "10", "Nov": "11", "Des": "12",
+}
+
+// Splits a time range like "13.00 - 15.50" into "13:00" and "15:50".
+func parseScheduleTime(s string) (start, end string) {
+	parts := strings.SplitN(s, " - ", 2)
+	if len(parts) != 2 {
+		return strings.ReplaceAll(s, ".", ":"), ""
+	}
+	return strings.ReplaceAll(strings.TrimSpace(parts[0]), ".", ":"),
+		strings.ReplaceAll(strings.TrimSpace(parts[1]), ".", ":")
+}
+
+// Parses an Indonesian date string like "11 Feb 2026" into ISO 8601 "2026-02-11".
+// Returns the original string if parsing fails.
+func parseIndonesianDate(s string) string {
+	parts := strings.Fields(s)
+	if len(parts) != 3 {
+		return s
+	}
+	month, ok := idMonths[parts[1]]
+	if !ok {
+		return s
+	}
+	day := parts[0]
+	if len(day) == 1 {
+		day = "0" + day
+	}
+	return parts[2] + "-" + month + "-" + day
 }

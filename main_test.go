@@ -120,8 +120,8 @@ const testScheduleHTML = `<html><body>
 	</td>
 	<td>
 		<ul>
-			<li>Senin / 1945-01-06 / 07:00-09:00 / 7602 / Kuliah / Offline</li>
-			<li>Rabu / 1945-01-08 / 13:00-15:00 / 7603 / Kuliah / Online</li>
+			<li>Senin / 6 Jan 1945 / 07.00 - 09.00 / 7602 / Kuliah / Offline</li>
+			<li>Rabu / 8 Jan 1945 / 13.00 - 15.00 / 7603 / Kuliah / Online</li>
 		</ul>
 	</td>
 </tr>
@@ -137,7 +137,7 @@ const testScheduleHTML = `<html><body>
 	<td></td>
 	<td>
 		<ul>
-			<li>Selasa / 1945-01-07 / 09:00-11:00 / 7604 / Kuliah / Offline</li>
+			<li>Selasa / 7 Jan 1945 / 09.00 - 11.00 / 7604 / Kuliah / Offline</li>
 		</ul>
 	</td>
 </tr>
@@ -179,14 +179,15 @@ func TestParseClasses(t *testing.T) {
 	if len(c.Lecturers) != 2 || c.Lecturers[0] != "Dosen A" || c.Lecturers[1] != "Dosen B" {
 		t.Errorf("Lecturers = %v, want [Dosen A, Dosen B]", c.Lecturers)
 	}
-	if c.Notes != "Catatan penting" {
-		t.Errorf("Notes = %q, want %q", c.Notes, "Catatan penting")
+	if c.Notes == nil || *c.Notes != "Catatan penting" {
+		t.Errorf("Notes = %v, want %q", c.Notes, "Catatan penting")
 	}
 	if len(c.Schedules) != 2 {
 		t.Fatalf("expected 2 schedules, got %d", len(c.Schedules))
 	}
-	if c.Schedules[0].Day != "Senin" || c.Schedules[0].Time != "07:00-09:00" || c.Schedules[0].Room != "7602" {
-		t.Errorf("Schedule[0] = %+v", c.Schedules[0])
+	s0 := c.Schedules[0]
+	if s0.ISODay != 1 || s0.StartTime != "07:00" || s0.EndTime != "09:00" || len(s0.Rooms) != 1 || s0.Rooms[0] != "7602" {
+		t.Errorf("Schedule[0] = %+v", s0)
 	}
 	if c.Schedules[1].Method != "Online" {
 		t.Errorf("Schedule[1].Method = %q, want Online", c.Schedules[1].Method)
@@ -198,6 +199,9 @@ func TestParseClasses(t *testing.T) {
 	}
 	if len(c2.Lecturers) != 1 {
 		t.Errorf("expected 1 lecturer for second class, got %d", len(c2.Lecturers))
+	}
+	if c2.Notes != nil {
+		t.Errorf("expected nil Notes for second class, got %q", *c2.Notes)
 	}
 }
 
@@ -230,8 +234,8 @@ func TestParseClasses_SkipsEmptyCode(t *testing.T) {
 
 func TestParseSchedules_Deduplication(t *testing.T) {
 	html := `<ul>
-		<li>Senin / 1945-01-06 / 07:00-09:00 / 7602 / Kuliah / Offline</li>
-		<li>Senin / 1945-01-13 / 07:00-09:00 / 7602 / Kuliah / Offline</li>
+		<li>Senin / 6 Jan 1945 / 07.00 - 09.00 / 7602 / Kuliah / Offline</li>
+		<li>Senin / 13 Jan 1945 / 07.00 - 09.00 / 7602 / Kuliah / Offline</li>
 	</ul>`
 	doc := docFromHTML(html)
 	sel := doc.Find("ul")
@@ -243,7 +247,7 @@ func TestParseSchedules_Deduplication(t *testing.T) {
 
 func TestParseSchedules_SkipsTampilkanSemua(t *testing.T) {
 	html := `<ul>
-		<li>Senin / 1945-01-06 / 07:00-09:00 / 7602 / Kuliah / Offline</li>
+		<li>Senin / 6 Jan 1945 / 07.00 - 09.00 / 7602 / Kuliah / Offline</li>
 		<li>Tampilkan semua jadwal</li>
 	</ul>`
 	doc := docFromHTML(html)
