@@ -279,9 +279,8 @@ func TestParseLecturers_Empty(t *testing.T) {
 }
 
 func clearCache() {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	scheduleCache = make(map[string]cacheEntry)
+	scheduleCache = NewCache[[]CourseClass](cacheTTL)
+	userCache = NewCache[UserResponse](cacheTTL)
 }
 
 func TestCache_SetAndGet(t *testing.T) {
@@ -289,23 +288,23 @@ func TestCache_SetAndGet(t *testing.T) {
 	data := []CourseClass{{Code: "FI1210", Name: "Test"}}
 	now := time.Now()
 
-	setCache("key1", data, now)
+	scheduleCache.Set("key1", data, now)
 
-	entry, ok := getCached("key1")
+	entry, ok := scheduleCache.Get("key1")
 	if !ok {
 		t.Fatal("expected cache hit")
 	}
-	if len(entry.data) != 1 || entry.data[0].Code != "FI1210" {
-		t.Errorf("cached data mismatch: %+v", entry.data)
+	if len(entry.Data) != 1 || entry.Data[0].Code != "FI1210" {
+		t.Errorf("cached data mismatch: %+v", entry.Data)
 	}
-	if !entry.fetchedAt.Equal(now) {
-		t.Errorf("fetchedAt = %v, want %v", entry.fetchedAt, now)
+	if !entry.FetchedAt.Equal(now) {
+		t.Errorf("FetchedAt = %v, want %v", entry.FetchedAt, now)
 	}
 }
 
 func TestCache_Miss(t *testing.T) {
 	clearCache()
-	_, ok := getCached("nonexistent")
+	_, ok := scheduleCache.Get("nonexistent")
 	if ok {
 		t.Error("expected cache miss")
 	}
@@ -314,14 +313,14 @@ func TestCache_Miss(t *testing.T) {
 func TestCache_Expiry(t *testing.T) {
 	clearCache()
 
-	cacheMu.Lock()
-	scheduleCache["expired"] = cacheEntry{
-		data:      []CourseClass{{Code: "OLD"}},
-		expiresAt: time.Now().Add(-1 * time.Second),
+	scheduleCache.mu.Lock()
+	scheduleCache.items["expired"] = CacheItem[[]CourseClass]{
+		Data:      []CourseClass{{Code: "OLD"}},
+		ExpiresAt: time.Now().Add(-1 * time.Second),
 	}
-	cacheMu.Unlock()
+	scheduleCache.mu.Unlock()
 
-	_, ok := getCached("expired")
+	_, ok := scheduleCache.Get("expired")
 	if ok {
 		t.Error("expected cache miss for expired entry")
 	}
@@ -436,7 +435,7 @@ func TestScheduleHandler_CacheHit(t *testing.T) {
 
 	cached := []CourseClass{{Code: "CACHED01", Name: "From Cache"}}
 	key := buildScheduleURL("123", "1945-1", url.Values{})
-	setCache(key, cached, time.Now())
+	scheduleCache.Set(key, cached, time.Now())
 
 	req := httptest.NewRequest("GET", "/api/schedule?student_id=123&semester=1945-1", nil)
 	addAuthHeaders(req)
@@ -486,7 +485,7 @@ func TestScheduleHandler_RefreshBypassesCache(t *testing.T) {
 
 	cached := []CourseClass{{Code: "STALE", Name: "Stale Data"}}
 	key := buildScheduleURL("123", "1945-1", url.Values{})
-	setCache(key, cached, time.Now())
+	scheduleCache.Set(key, cached, time.Now())
 
 	req := httptest.NewRequest("GET", "/api/schedule?student_id=123&semester=1945-1&refresh=true", nil)
 	addAuthHeaders(req)
@@ -550,7 +549,84 @@ func TestScheduleHandler_ExpiredToken(t *testing.T) {
 	}
 }
 
+func TestUserHandler_CacheHit(t *testing.T) {
+	clearCache()
+
+	cached := UserResponse{StudentID: "999", Semester: "2099-1"}
+	userCache.Set("test-token", cached, time.Now())
+
+	req := httptest.NewRequest("GET", "/api/user", nil)
+	req.Header.Set("X-Six-Khongguan", "test-token")
+	w := httptest.NewRecorder()
+	userHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got status %d, want 200", w.Code)
+	}
+
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Success {
+		t.Error("expected success to be true")
+	}
+	if resp.Meta == nil || !resp.Meta.Cached {
+		t.Error("expected meta.cached to be true")
+	}
+
+	dataBytes, _ := json.Marshal(resp.Data)
+	var user UserResponse
+	json.Unmarshal(dataBytes, &user)
+	if user.StudentID != "999" || user.Semester != "2099-1" {
+		t.Errorf("expected cached user response, got %+v", user)
+	}
+}
+
+func TestUserHandler_RefreshBypassesCache(t *testing.T) {
+	clearCache()
+
+	ts := mockSIX("123", "1945-1")
+	defer ts.Close()
+
+	origURL := sixBaseURL
+	sixBaseURL = ts.URL
+	defer func() { sixBaseURL = origURL }()
+
+	cached := UserResponse{StudentID: "999", Semester: "2099-1"}
+	userCache.Set("test", cached, time.Now())
+
+	req := httptest.NewRequest("GET", "/api/user?refresh=true", nil)
+	addAuthHeaders(req)
+	w := httptest.NewRecorder()
+	userHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got status %d, want 200", w.Code)
+	}
+
+	var resp APIResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Success {
+		t.Errorf("expected success, got error: %s", resp.Error)
+	}
+	if resp.Meta == nil || resp.Meta.Cached {
+		t.Error("expected non-cached fresh response")
+	}
+
+	dataBytes, _ := json.Marshal(resp.Data)
+	var user UserResponse
+	json.Unmarshal(dataBytes, &user)
+	if user.StudentID == "999" {
+		t.Errorf("expected fresh user response from upstream, got %+v", user)
+	}
+}
+
 func TestUserHandler_ExpiredToken(t *testing.T) {
+	clearCache()
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, unauthenticatedHTML)
 	}))
@@ -581,8 +657,8 @@ func TestUserHandler_MissingToken(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/user", nil)
 	w := httptest.NewRecorder()
 	userHandler(w, req)
-	if w.Code != http.StatusBadGateway {
-		t.Errorf("got status %d, want %d", w.Code, http.StatusBadGateway)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("got status %d, want %d", w.Code, http.StatusUnauthorized)
 	}
 	var resp APIResponse
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {

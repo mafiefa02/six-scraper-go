@@ -75,16 +75,69 @@ type Meta struct {
 	Cached    bool      `json:"cached"`
 }
 
-type cacheEntry struct {
-	data      []CourseClass
-	fetchedAt time.Time
-	expiresAt time.Time
+// CacheItem is a generic container for cached data.
+type CacheItem[T any] struct {
+	Data      T
+	FetchedAt time.Time
+	ExpiresAt time.Time
+}
+
+// Cache is a generic, thread-safe, in-memory cache.
+type Cache[T any] struct {
+	mu    sync.RWMutex
+	items map[string]CacheItem[T]
+	ttl   time.Duration
+}
+
+// NewCache initializes a new generic cache.
+func NewCache[T any](ttl time.Duration) *Cache[T] {
+	return &Cache[T]{
+		items: make(map[string]CacheItem[T]),
+		ttl:   ttl,
+	}
+}
+
+// Get retrieves an item of type T from the cache if it hasn't expired.
+func (c *Cache[T]) Get(key string) (CacheItem[T], bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	item, ok := c.items[key]
+	if !ok || time.Now().After(item.ExpiresAt) {
+		return CacheItem[T]{}, false
+	}
+	return item, true
+}
+
+// Set stores an item of type T in the cache.
+func (c *Cache[T]) Set(key string, data T, fetchedAt time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.items[key] = CacheItem[T]{
+		Data:      data,
+		FetchedAt: fetchedAt,
+		ExpiresAt: time.Now().Add(c.ttl),
+	}
+}
+
+// EvictExpired removes all expired keys from this specific cache instance.
+func (c *Cache[T]) EvictExpired() {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, v := range c.items {
+		if now.After(v.ExpiresAt) {
+			delete(c.items, k)
+		}
+	}
 }
 
 var (
-	scheduleCache = make(map[string]cacheEntry)
-	cacheMu       sync.RWMutex
+	scheduleCache = NewCache[[]CourseClass](cacheTTL)
 	sfGroup       singleflight.Group
+	userCache     = NewCache[UserResponse](cacheTTL)
+	userSfGroup   singleflight.Group
 )
 
 var errUnauthenticated = errors.New("khongguan token is expired or invalid")
@@ -266,60 +319,102 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func userHandler(w http.ResponseWriter, r *http.Request) {
-	doc, _, err := fetchDoc(sixBaseURL+"/home", r)
-	if err != nil {
-		writeError(w, errStatus(err), err.Error())
+	token := r.Header.Get("X-Six-Khongguan")
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "missing required khongguan token")
 		return
 	}
 
-	var studentID string
-	doc.Find("a[href*='mahasiswa:']").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-		href, _ := s.Attr("href")
-		if m := studentIDRe.FindStringSubmatch(href); len(m) > 1 {
-			studentID = m[1]
-			return false
+	refresh := r.URL.Query().Get("refresh") == "true"
+
+	if !refresh {
+		if entry, ok := userCache.Get(token); ok {
+			log.Printf("user cache hit")
+			writeSuccessWithMeta(w, entry.Data, &Meta{FetchedAt: entry.FetchedAt, Cached: true})
+			return
 		}
-		return true
+	}
+	log.Printf("user cache miss refresh=%v", refresh)
+
+	type sfUserResult struct {
+		user      UserResponse
+		fetchedAt time.Time
+	}
+
+	v, err, _ := userSfGroup.Do(token, func() (any, error) {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		reqWithCtx := r.WithContext(fetchCtx)
+
+		// 1. Fetch the home page
+		doc, _, err := fetchDoc(sixBaseURL+"/home", reqWithCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		var studentID string
+		doc.Find("a[href*='mahasiswa:']").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+			href, _ := s.Attr("href")
+			if m := studentIDRe.FindStringSubmatch(href); len(m) > 1 {
+				studentID = m[1]
+				return false
+			}
+			return true
+		})
+
+		if studentID == "" {
+			return nil, errors.New("could not find student ID on /home")
+		}
+
+		// 2. Follow redirect to get the semester
+		redirectURL := fmt.Sprintf("%s/app/mahasiswa:%s/kelas", sixBaseURL, studentID)
+		req, err := newSIXRequest(fetchCtx, redirectURL, reqWithCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("unexpected upstream status: %s", resp.Status)
+		}
+
+		if resp.Request.URL.Path == "/home" {
+			return nil, errUnauthenticated
+		}
+
+		finalURL := resp.Request.URL.String()
+		m := semesterRe.FindStringSubmatch(finalURL)
+		if len(m) < 2 {
+			return nil, fmt.Errorf("could not infer semester from redirect URL: %s", finalURL)
+		}
+
+		now := time.Now()
+		user := UserResponse{StudentID: studentID, Semester: m[1]}
+		userCache.Set(token, user, now)
+
+		return sfUserResult{user: user, fetchedAt: now}, nil
 	})
 
-	if studentID == "" {
-		writeError(w, http.StatusNotFound, "Could not find student ID on /home")
-		return
-	}
-
-	redirectURL := fmt.Sprintf("%s/app/mahasiswa:%s/kelas", sixBaseURL, studentID)
-	req, err := newSIXRequest(r.Context(), redirectURL, r)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		// Map our internal string error back to the standard error response
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUnauthenticated) || strings.Contains(err.Error(), "khongguan token is expired") {
+			status = http.StatusUnauthorized
+		} else if strings.Contains(err.Error(), "could not find student ID") {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
 		return
 	}
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		writeError(w, http.StatusBadGateway, "unexpected upstream status: "+resp.Status)
-		return
-	}
-
-	// A redirect to /home means the token has expired.
-	if resp.Request.URL.Path == "/home" {
-		writeError(w, http.StatusUnauthorized, errUnauthenticated.Error())
-		return
-	}
-
-	finalURL := resp.Request.URL.String()
-	m := semesterRe.FindStringSubmatch(finalURL)
-	if len(m) < 2 {
-		writeError(w, http.StatusNotFound, "Could not infer semester from redirect URL: "+finalURL)
-		return
-	}
-
-	writeSuccess(w, UserResponse{StudentID: studentID, Semester: m[1]})
+	result := v.(sfUserResult)
+	writeSuccessWithMeta(w, result.user, &Meta{FetchedAt: result.fetchedAt, Cached: false})
 }
 
 func scheduleHandler(w http.ResponseWriter, r *http.Request) {
@@ -345,9 +440,9 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 	refresh := query.Get("refresh") == "true"
 
 	if !refresh {
-		if entry, ok := getCached(targetURL); ok {
+		if entry, ok := scheduleCache.Get(targetURL); ok {
 			log.Printf("cache hit student_id=%s semester=%s", studentID, semester)
-			writeSuccessWithMeta(w, entry.data, &Meta{FetchedAt: entry.fetchedAt, Cached: true})
+			writeSuccessWithMeta(w, entry.Data, &Meta{FetchedAt: entry.FetchedAt, Cached: true})
 			return
 		}
 	}
@@ -378,7 +473,7 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		classes := parseClasses(doc)
 		log.Printf("parsed classes=%d student_id=%s semester=%s", len(classes), studentID, semester)
-		setCache(targetURL, classes, now)
+		scheduleCache.Set(targetURL, classes, now)
 		return sfResult{classes: classes, fetchedAt: now}, nil
 	})
 
@@ -391,31 +486,9 @@ func scheduleHandler(w http.ResponseWriter, r *http.Request) {
 	writeSuccessWithMeta(w, result.classes, &Meta{FetchedAt: result.fetchedAt, Cached: false})
 }
 
-func getCached(key string) (cacheEntry, bool) {
-	cacheMu.RLock()
-	defer cacheMu.RUnlock()
-	entry, ok := scheduleCache[key]
-	if !ok || time.Now().After(entry.expiresAt) {
-		return cacheEntry{}, false
-	}
-	return entry, true
-}
-
-func setCache(key string, data []CourseClass, fetchedAt time.Time) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	scheduleCache[key] = cacheEntry{data: data, fetchedAt: fetchedAt, expiresAt: time.Now().Add(cacheTTL)}
-}
-
 func evictExpired() {
-	now := time.Now()
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	for k, v := range scheduleCache {
-		if now.After(v.expiresAt) {
-			delete(scheduleCache, k)
-		}
-	}
+	scheduleCache.EvictExpired()
+	userCache.EvictExpired()
 }
 
 func startCacheEviction(ctx context.Context) {
@@ -495,16 +568,16 @@ func parseLecturers(cell *goquery.Selection) []string {
 }
 
 type scheduleKey struct {
-	ISODay                        int
+	ISODay                               int
 	StartTime, EndTime, Activity, Method string
 }
 
 func parseSchedules(cell *goquery.Selection) []ScheduleEntry {
 	type accumulator struct {
-		dates     []string
-		dateSeen  map[string]bool
-		rooms     []string
-		roomSeen  map[string]bool
+		dates    []string
+		dateSeen map[string]bool
+		rooms    []string
+		roomSeen map[string]bool
 	}
 
 	var order []scheduleKey
