@@ -128,7 +128,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    listenAddr,
-		Handler: mux,
+		Handler: corsMiddleware(mux),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -151,6 +151,20 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	allowedOrigin := envOrDefault("CORS_ORIGIN", "http://localhost:3000")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "X-Six-Khongguan")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Wraps a handler and logs method, path, status, and total duration.
